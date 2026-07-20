@@ -110,7 +110,15 @@ main{flex:1; padding:28px; max-width:1280px; margin:0 auto; width:100%;}
   background:var(--navy-deep); border-radius:28px; overflow:hidden;
   box-shadow:var(--shadow);
 }
-.scanner-frame video{width:100%; height:100%; object-fit:cover; transform:scaleX(-1);}
+.scanner-frame video{width:100%; height:100%; object-fit:cover;}
+.scanner-frame video.mirrored{transform:scaleX(-1);}
+.scanner-frame .btn-switch-cam{
+  position:absolute; top:14px; right:14px; z-index:5; width:38px; height:38px; border-radius:50%;
+  background:rgba(14,34,63,.6); border:1px solid rgba(255,255,255,.35); color:#fff; font-size:16px;
+  display:flex; align-items:center; justify-content:center; cursor:pointer; backdrop-filter:blur(2px);
+}
+.scanner-frame .btn-switch-cam:active{transform:scale(.92);}
+.scanner-frame .btn-switch-cam[hidden]{display:none;}
 .scanner-frame .corner{
   position:absolute; width:38px; height:38px; border-color:var(--brass);
   transition:border-color .25s, transform .25s; z-index:3;
@@ -245,7 +253,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--navy);}
 .id-card .id-info{flex:1; min-width:0;}
 .id-card .id-info .nama{font-family:var(--font-display); font-weight:700; font-size:15px; line-height:1.2;}
 .id-card .id-info .nip{font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:3px;}
-.id-card .id-qr{flex-shrink:0;}
+.id-card .id-qr{flex-shrink:0; background:#fff; padding:6px; border-radius:6px;}
 .id-card .id-foot{padding:7px 14px 12px; font-size:10px; color:var(--muted); text-align:center; border-top:1px dashed var(--line);}
 @media print{
   .id-card{break-inside:avoid; page-break-inside:avoid;}
@@ -402,6 +410,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--navy);}
             <div class="scanner-frame" id="scannerFrame">
               <video id="video" autoplay muted playsinline></video>
               <canvas id="qrCanvas" style="display:none;"></canvas>
+              <button class="btn-switch-cam" id="btnSwitchCam" type="button" title="Ganti kamera depan/belakang" hidden>🔄</button>
               <div class="scanline"></div>
               <span class="corner tl"></span><span class="corner tr"></span>
               <span class="corner bl"></span><span class="corner br"></span>
@@ -1047,7 +1056,35 @@ function waitForFaceApi(){
 
 // Kamera TIDAK auto-start: banyak browser HP (terutama iOS Safari) memblokir
 // getUserMedia tanpa sentuhan/gesture pengguna. Tombol "Aktifkan Kamera" memicu ini.
-async function startCamera(){
+// currentFacing menyimpan kamera yang sedang aktif ('user' = depan, 'environment' = belakang).
+// Mode Wajah default ke kamera depan, mode QR default ke kamera belakang (lebih tajam & mudah
+// fokus dekat untuk memindai kartu/kode QR cetak) — namun pengguna tetap bisa menekan tombol
+// "🔄" untuk berpindah kamera kapan saja, di mode manapun.
+let currentFacing = 'user';
+let camSwitchedManually = false;
+function defaultFacingForMode(){ return state.scanMode === 'qr' ? 'environment' : 'user'; }
+function stopCameraTracks(){
+  if (videoStream){ videoStream.getTracks().forEach(t=>t.stop()); videoStream = null; }
+}
+function applyMirrorClass(){
+  const video = document.getElementById('video');
+  video.classList.toggle('mirrored', currentFacing === 'user');
+}
+async function requestCameraStream(facingMode){
+  const wantsBack = facingMode === 'environment';
+  return navigator.mediaDevices.getUserMedia({
+    // Resolusi lebih tinggi untuk kamera belakang: penting agar kode QR pada kartu cetak
+    // (yang biasanya dipindai dari jarak lebih jauh & butuh detail lebih tajam) terbaca jsQR.
+    video: {
+      width:{ideal: wantsBack ? 640 : 320},
+      height:{ideal: wantsBack ? 640 : 320},
+      facingMode:{ideal: facingMode},
+      frameRate:{ideal:15, max:24}
+    },
+    audio: false
+  });
+}
+async function startCamera(facingMode){
   const video = document.getElementById('video');
   if (!window.isSecureContext){
     throw new Error('Kamera hanya bisa diakses lewat HTTPS. Buka aplikasi ini melalui URL Web App Google Apps Script (https://script.google.com/.../exec) atau hosting HTTPS — jangan membuka file HTML langsung (file://), terutama di HP.');
@@ -1055,21 +1092,50 @@ async function startCamera(){
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     throw new Error('Perangkat/browser ini tidak mendukung akses kamera.');
   }
+  const desired = facingMode || (camSwitchedManually ? currentFacing : defaultFacingForMode());
+  stopCameraTracks();
   try{
-    videoStream = await navigator.mediaDevices.getUserMedia({
-      video: { width:{ideal:320}, height:{ideal:320}, facingMode:{ideal:'user'}, frameRate:{ideal:15, max:24} },
-      audio: false
-    });
+    videoStream = await requestCameraStream(desired);
+    currentFacing = desired;
   } catch(err){
-    if (err && err.name === 'NotAllowedError') throw new Error('Izin kamera ditolak. Aktifkan izin kamera untuk browser ini di pengaturan HP/PC, lalu muat ulang halaman.');
-    if (err && err.name === 'NotFoundError') throw new Error('Kamera tidak ditemukan pada perangkat ini.');
-    if (err && err.name === 'NotReadableError') throw new Error('Kamera sedang dipakai aplikasi lain. Tutup aplikasi lain yang memakai kamera lalu coba lagi.');
-    if (err && err.name === 'OverconstrainedError') throw new Error('Kamera perangkat tidak mendukung resolusi yang diminta.');
-    throw new Error('Gagal mengakses kamera: ' + (err && err.message ? err.message : err));
+    // Jika kamera belakang diminta tapi tidak tersedia (mis. laptop tanpa rear camera),
+    // coba jatuh balik ke kamera depan alih-alih gagal total.
+    if (desired === 'environment' && err && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')){
+      try{
+        videoStream = await requestCameraStream('user');
+        currentFacing = 'user';
+      } catch(err2){ throwCameraError(err2); }
+    } else {
+      throwCameraError(err);
+    }
   }
   video.srcObject = videoStream;
+  applyMirrorClass();
+  document.getElementById('btnSwitchCam').hidden = false;
   return new Promise(res => video.onloadedmetadata = res);
 }
+function throwCameraError(err){
+  if (err && err.name === 'NotAllowedError') throw new Error('Izin kamera ditolak. Aktifkan izin kamera untuk browser ini di pengaturan HP/PC, lalu muat ulang halaman.');
+  if (err && err.name === 'NotFoundError') throw new Error('Kamera tidak ditemukan pada perangkat ini.');
+  if (err && err.name === 'NotReadableError') throw new Error('Kamera sedang dipakai aplikasi lain. Tutup aplikasi lain yang memakai kamera lalu coba lagi.');
+  if (err && err.name === 'OverconstrainedError') throw new Error('Kamera perangkat tidak mendukung resolusi yang diminta.');
+  throw new Error('Gagal mengakses kamera: ' + (err && err.message ? err.message : err));
+}
+document.getElementById('btnSwitchCam').onclick = async () => {
+  const btn = document.getElementById('btnSwitchCam');
+  if (!cameraActive) return;
+  btn.disabled = true;
+  const next = currentFacing === 'user' ? 'environment' : 'user';
+  try{
+    await startCamera(next);
+    camSwitchedManually = true;
+    toast('Kamera ' + (next === 'environment' ? 'belakang' : 'depan') + ' aktif', 'ok');
+  } catch(e){
+    toast(e.message || 'Gagal beralih kamera', 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
 document.getElementById('btnStartCamera').onclick = async () => {
   const btn = document.getElementById('btnStartCamera');
   btn.disabled = true; btn.textContent = 'Mengaktifkan…';
@@ -1171,7 +1237,7 @@ async function tickQr(video, canvas, ctx){
 
 /* mode-tabs: ganti antara pemindaian Wajah dan QR Code */
 document.querySelectorAll('#modeTabs button').forEach(btn=>{
-  btn.addEventListener('click', ()=>{
+  btn.addEventListener('click', async ()=>{
     document.querySelectorAll('#modeTabs button').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
     state.scanMode = btn.dataset.mode;
@@ -1181,6 +1247,14 @@ document.querySelectorAll('#modeTabs button').forEach(btn=>{
     document.getElementById('scannerCaption').textContent = state.scanMode === 'qr'
       ? 'Arahkan kartu/kode QR pegawai ke dalam bingkai kamera.'
       : 'Posisikan wajah di dalam bingkai. Pastikan pencahayaan cukup.';
+    // Jika kamera sedang aktif dan pengguna belum pernah memilih kamera secara manual,
+    // pindahkan otomatis ke kamera yang sesuai untuk mode ini (QR -> belakang, Wajah -> depan).
+    if (cameraActive && !camSwitchedManually){
+      const target = defaultFacingForMode();
+      if (target !== currentFacing){
+        try{ await startCamera(target); } catch(e){ /* biarkan tetap di kamera sebelumnya jika gagal */ }
+      }
+    }
   });
 });
 
@@ -1258,21 +1332,55 @@ document.getElementById('btnSaveHari').onclick = async () => {
   const r = await runServer('saveSettings', state.sessionPassword, { hariKerja: checked.join(',') });
   if (r.ok){ state.setting.hariKerja = checked.join(','); toast(r.msg,'ok'); } else toast(r.msg,'err');
 };
+// Link "berbagi" Google Drive (…/file/d/FILE_ID/view?usp=sharing atau …?id=FILE_ID) TIDAK bisa
+// dipakai langsung sebagai <img src>. Fungsi ini mendeteksi link Drive & mengubahnya menjadi
+// link direct-embed lewat endpoint thumbnail Drive, yang jauh lebih andal untuk hotlink gambar
+// publik dibanding endpoint uc?export=view (yang sering menampilkan halaman konfirmasi virus-scan).
+function convertGoogleDriveLink(url){
+  if (!url) return url;
+  let id = null;
+  let m = url.match(/\/file\/d\/([a-zA-Z0-9_-]{10,})/);
+  if (m) id = m[1];
+  if (!id){ m = url.match(/[?&]id=([a-zA-Z0-9_-]{10,})/); if (m) id = m[1]; }
+  if (!id) return url; // bukan link Drive yang dikenali, biarkan apa adanya
+  return 'https://drive.google.com/thumbnail?id=' + id + '&sz=w1000';
+}
+function applyLogoUrlConversion(showToast){
+  const inp = document.getElementById('logoUrlInput');
+  const raw = inp.value.trim();
+  const converted = convertGoogleDriveLink(raw);
+  if (converted !== raw){
+    inp.value = converted;
+    if (showToast) toast('Link Google Drive otomatis dikonversi ke direct link', 'ok');
+  }
+  return inp.value.trim();
+}
 document.getElementById('btnSaveSekolah').onclick = async () => {
+  const logoUrl = applyLogoUrlConversion(true);
   const payload = {
     namaSekolah: document.getElementById('namaSekolah').value,
     namaKepsek: document.getElementById('namaKepsek').value,
     nipKepsek: document.getElementById('nipKepsek').value,
-    logoUrl: document.getElementById('logoUrlInput').value.trim()
+    logoUrl
   };
   const r = await runServer('saveSettings', state.sessionPassword, payload);
   if (r.ok){ Object.assign(state.setting, payload); toast(r.msg,'ok'); applyBranding(); } else toast(r.msg,'err');
 };
-document.getElementById('logoUrlInput').addEventListener('input', e=>{
-  const url = e.target.value.trim();
+function refreshLogoPreview(){
+  const url = document.getElementById('logoUrlInput').value.trim();
   const prev = document.getElementById('logoPreview');
   if (url){ prev.onerror = ()=>{ prev.style.display='none'; }; prev.src = url; prev.style.display='block'; }
   else { prev.style.display='none'; }
+}
+document.getElementById('logoUrlInput').addEventListener('input', refreshLogoPreview);
+// paste & blur: konversi otomatis link Drive begitu ditempel atau setelah pengguna
+// meninggalkan kolom (menutupi kasus paste lewat klik-kanan > Tempel di HP, yang kadang
+// tidak memicu event 'paste' standar).
+document.getElementById('logoUrlInput').addEventListener('paste', ()=>{
+  setTimeout(()=>{ applyLogoUrlConversion(true); refreshLogoPreview(); }, 0);
+});
+document.getElementById('logoUrlInput').addEventListener('blur', ()=>{
+  applyLogoUrlConversion(true); refreshLogoPreview();
 });
 
 /* =========================================================
@@ -1610,7 +1718,10 @@ function renderKartu(){
   list.forEach(g=>{
     const qrId = 'qrKartu_' + g.nip.replace(/[^a-zA-Z0-9]/g,'');
     const el = document.getElementById(qrId);
-    if (el && window.QRCode) new QRCode(el, { text: g.nip, width: 64, height: 64, correctLevel: QRCode.CorrectLevel.M });
+    // Ukuran diperbesar (64->100px) & correctLevel diturunkan ke L: NIP relatif pendek, jadi
+    // koreksi error tinggi (M) hanya membuat modul QR lebih rapat/kecil tanpa manfaat berarti,
+    // yang justru menyulitkan kamera HP memindai kartu cetak dari jarak normal.
+    if (el && window.QRCode) new QRCode(el, { text: g.nip, width: 100, height: 100, correctLevel: QRCode.CorrectLevel.L });
   });
 }
 
